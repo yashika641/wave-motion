@@ -1,0 +1,62 @@
+# ---------------------------
+# CORE SERVER
+# ---------------------------
+fastapi==0.110.2
+uvicorn==0.29.0
+python-multipart==0.0.9
+python-dotenv==1.0.1
+
+# ---------------------------
+# SUPABASE (no proxy crash)
+# ---------------------------
+supabase==2.2.1
+websockets==12.0
+httpx==0.24.1
+postgrest==0.13.0
+realtime==1.0.6
+gotrue==2.4.2
+storage3==0.7.7
+
+PyJWT==2.8.0
+
+# ---------------------------
+# IMAGE / VIDEO
+# ---------------------------
+opencv-python==4.8.1.78
+Pillow==10.2.0
+moviepy==1.0.3
+imageio==2.31.1
+imageio-ffmpeg==0.4.8
+ffmpeg-python==0.2.0
+
+# ---------------------------
+# AUDIO / TTS
+# ---------------------------
+gtts==2.5.4
+pydub==0.25.1
+
+# ---------------------------
+# WAV2LIP
+# ---------------------------
+numpy==1.26.4
+scipy==1.10.1
+librosa==0.10.1
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+
+# ---------------------------
+# DIFFUSERS / HF
+# ---------------------------
+transformers==4.37.0
+diffusers==0.27.0
+accelerate==0.28.0
+safetensors==0.4.2
+sentencepiece==0.1.99
+
+# ---------------------------
+# UTILITIES
+# ---------------------------
+requests==2.31.0
+tqdm==4.66.2
+python-dateutil==2.9.0.post0

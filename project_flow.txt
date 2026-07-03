@@ -1,0 +1,490 @@
+Great — here’s a complete, **practical step-by-step guide** you can follow now to finish the assignment using only Python for frontend & backend and using **Google Colab as the GPU inference engine**. I’ll give you exact folder structure, commands, ready-to-paste code for every piece (Colab, backend, frontend), and testing / submission checklist. I’ll assume:
+
+* You will run the frontend as a small Python web app (Flask) so everything is Python.
+* The heavy model (Wav2Lip) runs on Colab with GPU and exposes a simple HTTP endpoint (via ngrok).
+* Your backend (FastAPI) handles uploads, TTS (text→audio) and calls Colab for Wav2Lip, then returns the result to the frontend.
+
+I won’t ask clarifying questions — I’ll pick reasonable defaults so you can run end-to-end. Ready? Let’s go.
+
+---
+
+# 0 — Quick architecture summary
+
+```
+User Browser (form)  ->  Frontend (Flask)  ->  Backend API (FastAPI)
+       ⬇                                 (sends files/text)
+Frontend returns video <- Backend calls -> Colab (Flask + Wav2Lip) (GPU)
+                              Colab returns generated video -> Backend -> Frontend
+```
+
+* Frontend is simple HTML+JS served by Flask.
+* Backend is FastAPI (API endpoints + TTS).
+* Colab runs Wav2Lip and exposes `/run-wav2lip` via ngrok.
+* Files are passed between services over HTTP (multipart/form-data).
+
+---
+
+# 1 — Prerequisites (what you need)
+
+* Google account (for Colab).
+* Local machine: Python 3.9+ installed, pip.
+* System `ffmpeg` installed (on your machine and on Colab; Colab usually provides ffmpeg).
+
+  * Linux: `sudo apt install ffmpeg`
+  * macOS: `brew install ffmpeg`
+* Basic Git.
+* Optional but recommended: create a small directory for the project.
+
+---
+
+# 2 — Project folder layout (local)
+
+Create a top-level folder `wav2lip-project/` with this structure:
+
+```
+wav2lip-project/
+  colab/                    # Colab notebook lives on Google Colab (not necessarily local)
+  backend/
+    app/
+      main.py
+      colab_client.py
+      tts.py
+      utils.py
+    requirements.txt
+  frontend/
+    app.py
+    templates/
+      index.html
+    static/
+      (optional CSS/JS)
+  README.md
+```
+
+---
+
+# 3 — Prepare the Colab inference notebook (the GPU engine)
+
+Create a new Colab notebook and use the following *cells* (copy-paste):
+
+### Cell 1 — Setup & install Wav2Lip + dependencies
+
+```python
+# Clone Wav2Lip and install deps
+!git clone https://github.com/Rudrabha/Wav2Lip.git
+%cd Wav2Lip
+!pip install -r requirements.txt
+
+# If ffmpeg missing in Colab environment (usually present), uncomment:
+# !apt-get update && apt-get install -y ffmpeg
+```
+
+### Cell 2 — Place or download model checkpoint
+
+You need the Wav2Lip checkpoint. Options:
+
+* Upload it manually from your machine to Colab (use the left-side Files panel upload), then move it to `Wav2Lip/checkpoints/`.
+* Or if you have a direct link, use `wget <link>`.
+
+Example to create `checkpoints/` and move uploaded file:
+
+```python
+!mkdir -p checkpoints
+# If you uploaded the checkpoint to /content, move it:
+# !mv /content/wav2lip_gan.pth checkpoints/
+```
+
+> **Note:** the exact checkpoint filename depends on the repository. Check Wav2Lip README. Keep it in `Wav2Lip/checkpoints/`.
+
+### Cell 3 — Install Flask + flask-ngrok
+
+```python
+!pip install flask-ngrok flask
+```
+
+### Cell 4 — Colab inference server code (run this cell to start server)
+
+```python
+# Run this cell (it will block and print a public ngrok URL)
+from flask import Flask, request, send_file
+from flask_ngrok import run_with_ngrok
+import subprocess, uuid, os
+app = Flask(__name__)
+run_with_ngrok(app)  # prints public URL once server is running
+
+WAV2LIP_DIR = "/content/Wav2Lip"
+CHECKPOINT_PATH = os.path.join(WAV2LIP_DIR, "checkpoints", "wav2lip_gan.pth")  # adjust if different
+
+@app.route("/run-wav2lip", methods=["POST"])
+def run_wav2lip():
+    # expects multipart with keys: image (file) and audio (file)
+    uid = uuid.uuid4().hex
+    img_path = f"/content/in_{uid}.jpg"
+    aud_path = f"/content/in_{uid}.wav"
+    out_path = f"/content/out_{uid}.mp4"
+
+    if "image" not in request.files or "audio" not in request.files:
+        return {"error": "Provide image and audio files"}, 400
+
+    request.files["image"].save(img_path)
+    request.files["audio"].save(aud_path)
+
+    # Run the Wav2Lip inference command (adjust args if repo uses a different script/flag)
+    cmd = f"python {WAV2LIP_DIR}/inference.py --checkpoint_path {CHECKPOINT_PATH} --face {img_path} --audio {aud_path} --outfile {out_path}"
+    print("Running:", cmd)
+    try:
+        subprocess.check_call(cmd, shell=True)
+    except subprocess.CalledProcessError as e:
+        print("Wav2Lip failed:", e)
+        return {"error": "Wav2Lip inference failed"}, 500
+
+    # Return generated video
+    return send_file(out_path, mimetype="video/mp4")
+
+if __name__ == "__main__":
+    app.run()
+```
+
+* Run the cell. When it starts it will print a public URL like `http://xxxxxx.ngrok-free.app`. Copy that URL; you’ll use it in your local backend (store as `COLAB_URL`).
+* **Keep the Colab tab open** while demonstrating. (Ngrok url will change each time you restart runtime unless you have a paid ngrok or a saved authtoken.)
+
+**Notes / tips for Colab**
+
+* If you want a (semi-)stable ngrok URL: sign up at ngrok, get your authtoken, and call `!ngrok authtoken <TOKEN>` in Colab before starting flask-ngrok.
+* If your Wav2Lip CLI options differ, adapt the `cmd` string to match the repo version (check `Wav2Lip/inference.py` usage).
+
+---
+
+# 4 — Backend: FastAPI (local) — code & instructions
+
+Create `backend/requirements.txt`:
+
+```
+fastapi
+uvicorn[standard]
+requests
+python-multipart
+pydub
+gtts
+soundfile
+```
+
+Install locally:
+
+```bash
+cd wav2lip-project/backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+# also ensure ffmpeg is installed on your machine
+```
+
+Create `backend/app/colab_client.py` — handles calling Colab:
+
+```python
+import requests
+
+# Replace with the ngrok URL printed from Colab when running
+COLAB_URL = "https://YOUR_COLAB_NGROK_URL/run-wav2lip"
+
+def call_colab(image_path: str, audio_path: str, timeout=300):
+    files = {
+        "image": open(image_path, "rb"),
+        "audio": open(audio_path, "rb")
+    }
+    resp = requests.post(COLAB_URL, files=files, timeout=timeout)
+    resp.raise_for_status()
+    out_path = image_path + ".result.mp4"
+    with open(out_path, "wb") as f:
+        f.write(resp.content)
+    return out_path
+```
+
+Create `backend/app/tts.py` — text→audio helper:
+
+```python
+from gtts import gTTS
+from pydub import AudioSegment
+import os
+
+def text_to_wav(text: str, out_wav_path: str):
+    # Save as temporary mp3 then convert to wav at 16kHz mono
+    tmp_mp3 = out_wav_path + ".mp3"
+    tts = gTTS(text)
+    tts.save(tmp_mp3)
+
+    # Convert to wav 16000Hz mono (Wav2Lip often expects standard rates)
+    audio = AudioSegment.from_mp3(tmp_mp3)
+    audio = audio.set_frame_rate(16000).set_channels(1)
+    audio.export(out_wav_path, format="wav")
+    os.remove(tmp_mp3)
+    return out_wav_path
+```
+
+> gTTS uses the internet. If you want offline TTS, switch to pyttsx3 or Coqui TTS.
+
+Create `backend/app/utils.py` for safe file saving:
+
+```python
+import uuid
+from pathlib import Path
+
+TMP_DIR = Path("tmp")
+TMP_DIR.mkdir(exist_ok=True)
+
+def save_upload_file(upload_file, prefix="file"):
+    uid = uuid.uuid4().hex
+    ext = Path(upload_file.filename).suffix or ""
+    path = TMP_DIR / f"{prefix}_{uid}{ext}"
+    with open(path, "wb") as f:
+        f.write(upload_file.file.read())
+    return str(path)
+```
+
+Create `backend/app/main.py` — FastAPI app:
+
+```python
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import FileResponse
+from .utils import save_upload_file
+from .tts import text_to_wav
+from .colab_client import call_colab
+from pathlib import Path
+
+app = FastAPI()
+
+@app.post("/generate-from-text")
+async def generate_from_text(image: UploadFile = File(...), text: str = Form(...)):
+    # Save uploaded image
+    image_path = save_upload_file(image, prefix="img")
+    # Create TTS audio
+    audio_path = str(Path(image_path).with_suffix(".wav"))
+    text_to_wav(text, audio_path)
+    # Call Colab to run Wav2Lip
+    out_video = call_colab(image_path, audio_path)
+    return FileResponse(out_video, media_type="video/mp4", filename="result.mp4")
+
+@app.post("/generate-from-audio")
+async def generate_from_audio(image: UploadFile = File(...), audio: UploadFile = File(...)):
+    image_path = save_upload_file(image, prefix="img")
+    audio_path = save_upload_file(audio, prefix="aud")
+    out_video = call_colab(image_path, audio_path)
+    return FileResponse(out_video, media_type="video/mp4", filename="result.mp4")
+```
+
+Run backend:
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+**Important**: before running, set `COLAB_URL` in `colab_client.py` to the ngrok URL provided by Colab.
+
+---
+
+# 5 — Frontend: Flask (Python) — simple UI to upload & show video
+
+Install Flask if needed:
+
+```bash
+pip install Flask
+```
+
+Create `frontend/app.py`:
+
+```python
+from flask import Flask, render_template, request, redirect, url_for, send_file
+import requests, os
+from pathlib import Path
+
+BACKEND_URL = "http://localhost:8000"  # FastAPI backend
+
+app = Flask(__name__)
+TMP_DIR = Path("tmp_frontend")
+TMP_DIR.mkdir(exist_ok=True)
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/submit_text", methods=["POST"])
+def submit_text():
+    img = request.files.get("image")
+    text = request.form.get("text")
+    if not img or not text:
+        return "Provide image and text", 400
+
+    files = {"image": (img.filename, img.stream, img.mimetype)}
+    data = {"text": text}
+    resp = requests.post(f"{BACKEND_URL}/generate-from-text", files=files, data=data, stream=True)
+    if resp.status_code != 200:
+        return f"Error: {resp.text}", 500
+
+    out_path = TMP_DIR / "result_text.mp4"
+    with open(out_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024*1024):
+            if chunk:
+                f.write(chunk)
+    return redirect(url_for("show_video", filename="result_text.mp4"))
+
+@app.route("/submit_audio", methods=["POST"])
+def submit_audio():
+    img = request.files.get("image")
+    audio = request.files.get("audio")
+    if not img or not audio:
+        return "Provide image and audio", 400
+
+    files = {
+        "image": (img.filename, img.stream, img.mimetype),
+        "audio": (audio.filename, audio.stream, audio.mimetype)
+    }
+    resp = requests.post(f"{BACKEND_URL}/generate-from-audio", files=files, stream=True)
+    if resp.status_code != 200:
+        return f"Error: {resp.text}", 500
+
+    out_path = TMP_DIR / "result_audio.mp4"
+    with open(out_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024*1024):
+            if chunk:
+                f.write(chunk)
+    return redirect(url_for("show_video", filename="result_audio.mp4"))
+
+@app.route("/video/<filename>")
+def show_video(filename):
+    path = TMP_DIR / filename
+    if not path.exists():
+        return "Video not found", 404
+    return send_file(path, mimetype="video/mp4")
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
+```
+
+Create `frontend/templates/index.html`:
+
+```html
+<!doctype html>
+<html>
+<head>
+  <title>Wav2Lip Demo</title>
+</head>
+<body>
+  <h1>Generate lip-synced video</h1>
+
+  <h2>From Text</h2>
+  <form action="/submit_text" method="post" enctype="multipart/form-data">
+    <input type="file" name="image" accept="image/*" required><br>
+    <textarea name="text" placeholder="Enter text" required></textarea><br>
+    <button type="submit">Generate from text</button>
+  </form>
+
+  <h2>From Audio</h2>
+  <form action="/submit_audio" method="post" enctype="multipart/form-data">
+    <input type="file" name="image" accept="image/*" required><br>
+    <input type="file" name="audio" accept="audio/*" required><br>
+    <button type="submit">Generate from audio</button>
+  </form>
+</body>
+</html>
+```
+
+Run frontend:
+
+```bash
+python frontend/app.py
+```
+
+* Visit `http://127.0.0.1:5000/`.
+* Upload an image + text (or audio) and hit Generate. The frontend will call the backend, which triggers Colab.
+
+---
+
+# 6 — End-to-end testing checklist
+
+1. Start Colab server (run the cell that starts Flask/ngrok) and copy the ngrok URL.
+2. Edit `backend/app/colab_client.py` `COLAB_URL` to the ngrok URL.
+3. Start backend: `uvicorn app.main:app --reload --port 8000`.
+4. Start frontend: `python frontend/app.py`.
+5. Open frontend in browser, upload image + text. Wait (Wav2Lip inference may take a few seconds to tens of seconds).
+6. Result video should play on `/video/...`.
+7. If failure: check terminal logs in Colab (Colab shows inference logs) and backend logs (exceptions from requests).
+
+---
+
+# 7 — Practical tips, gotchas & improvements
+
+* **ngrok ephemeral URL**: each Colab session gives a new URL. For demo include instructions in README how to start Colab and update `colab_client.py`.
+* **Runtime lifetime**: Colab disconnects after inactivity or ~90 minutes; keep it running during demo.
+* **Model/checkpoint**: ensure the checkpoint is in `Wav2Lip/checkpoints/` in Colab.
+* **Audio format**: convert TTS or uploaded audio to 16kHz mono WAV (pydub via `text_to_wav` already does).
+* **Face quality**: Wav2Lip needs a clear frontal face. If image is low-res or angled, results degrade.
+* **Large files**: enforce file size limits on backend (e.g., max 10 MB).
+* **Timeouts**: Wav2Lip may take time—set `requests.post(..., timeout=300)` or longer.
+* **Security**: sanitize and validate uploads. For assignment, ok to keep simple, but mention this in README.
+* **Concurrency**: if multiple requests sent to Colab concurrently, performance may degrade; recommend queuing (for production: Celery + Redis + GPU pool).
+
+---
+
+# 8 — What to include in your submission (README + deliverables)
+
+In your repo, include:
+
+* `README.md` with:
+
+  * Architecture diagram (text or image)
+  * Steps to run (Colab start → update `COLAB_URL` → run backend → run frontend)
+  * Dependencies & install commands
+  * How to get Wav2Lip checkpoint (explain you downloaded and placed it in Colab)
+  * Notes about ngrok ephemeral URL and instructions to regenerate it
+* Provide:
+
+  * `frontend/` and `backend/` folders with code
+  * `colab/` folder with `.ipynb` (or link to the notebook you used)
+  * A short demo video (recording of you using the UI) if possible
+  * A `positive_negative_findings.md` file with observations (see suggested list below)
+
+---
+
+# 9 — Suggested positive & negative findings content (copy into your submission)
+
+**Positive findings**
+
+* Wav2Lip produces convincing lip sync on frontal, well-lit faces.
+* Using Colab as a GPU microservice is fast and cost-free for development/demo.
+* Modular design (separate TTS, backend API, inference service) makes swapping TTS engines or hosting trivial.
+* Using FastAPI + Flask kept the project fully Pythonic, easy to debug.
+
+**Negative findings / limitations**
+
+* Colab/ngrok are ephemeral; URL and runtime limits require manual restart during demo.
+* Quality drops for angled/low-res faces; artifacts appear at mouth edges sometimes.
+* gTTS prosody is limited — requires better TTS for natural intonation.
+* CPU-only local runs of Wav2Lip are unacceptably slow, so GPU is essential.
+* Concurrency: single Colab runtime is a bottleneck — production requires proper GPU service(s) and queueing.
+
+---
+
+# 10 — Optional: Docker + small notes
+
+* You can Dockerize the backend and frontend easily; skip Docker for the assignment unless asked. If you want a `docker-compose` that runs backend + frontend, I can generate that on request.
+* If you want a more stable public endpoint than ngrok, deploy the inference code to a small GPU VM (GCP/AWS/Azure) or use a Cloud Run / GKE GPU cluster (costly).
+
+---
+
+# 11 — Final sanity checklist before you present
+
+* ✅ Colab notebook cell that starts server runs successfully and prints ngrok URL.
+* ✅ `COLAB_URL` in `colab_client.py` updated to that URL.
+* ✅ Backend starts and exposes `/generate-from-text` and `/generate-from-audio`.
+* ✅ Frontend connects and downloads/plays `result.mp4`.
+* ✅ Include `sample_input.jpg` and `sample_output.mp4` in repo if possible.
+* ✅ README explains how to re-run Colab and update URL.
+
+---
+
+If you want, I can now:
+
+* generate **all files** for you (full `backend` and `frontend` code files) as downloadable content, or
+* produce a polished **README.md** ready to include in your repo, or
+* create a **Colab notebook .ipynb** cell bundle that you can drop straight into Colab.
+
+Which of those should I produce next? (I’ll generate the code/readme immediately.)
